@@ -1,0 +1,12 @@
+# Keep every text file LF in the repository and the working tree,
+# regardless of each contributor's core.autocrlf setting.
+* text=auto eol=lf
+
+# Windows batch scripts are the one format that requires CRLF.
+# None are tracked today; this is future-proofing.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binaries must never be normalized.
+*.exe binary
+*.o binary

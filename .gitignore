@@ -1,2 +1,12 @@
-.vscode
-build
+# Editor
+.vscode/
+
+# Build output
+build/
+*.o
+*.obj
+*.exe
+
+# Release staging binaries (deploy scripts stay tracked)
+packages/linux/deploy/cm
+packages/linux/deploy/cm_runner
