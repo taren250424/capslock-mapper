@@ -1,80 +1,90 @@
-#include <stdio.h>
+// Resident mapper process: turns Caps Lock into the left mouse button.
+// Built as a GUI-subsystem executable (see CMakeLists.txt), so it never
+// opens a console window and detaches from the terminal on its own.
+
 #include <windows.h>
-#include "constants/app_constants.h"
-#include "constants/key_constants.h"
-#include "constants/result_constants.h"
-#include "utils/mutex.h"
 
-int isLeftDown = 0;
+#include "app.h"
 
-void sendMouseLeftDown() {
-    INPUT input = {0};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    SendInput(1, &input, sizeof(INPUT));
+static int isLeftDown = 0;
+
+static void send_mouse(DWORD flags) {
+  INPUT input = {0};
+  input.type = INPUT_MOUSE;
+  input.mi.dwFlags = flags;
+  SendInput(1, &input, sizeof(INPUT));
 }
 
-void sendMouseLeftUp() {
-    INPUT input = {0};
-    input.type = INPUT_MOUSE;
-    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    SendInput(1, &input, sizeof(INPUT));
+static LRESULT CALLBACK keyboard_proc(int code, WPARAM wparam, LPARAM lparam) {
+  if (code == HC_ACTION) {
+    const KBDLLHOOKSTRUCT* key = (const KBDLLHOOKSTRUCT*)lparam;
+    if (key->vkCode == VK_CAPITAL) {
+      // While the key is held the OS keeps repeating WM_KEYDOWN (e.g. during
+      // a drag). isLeftDown guarantees exactly one down and one up event;
+      // without it the repeated downs would interrupt the drag.
+      if (wparam == WM_KEYDOWN && !isLeftDown) {
+        send_mouse(MOUSEEVENTF_LEFTDOWN);
+        isLeftDown = 1;
+      } else if (wparam == WM_KEYUP && isLeftDown) {
+        send_mouse(MOUSEEVENTF_LEFTUP);
+        isLeftDown = 0;
+      }
+      // Swallow Caps Lock in every case, including auto-repeats, so the
+      // toggle state never changes while the mapper runs.
+      return 1;
+    }
+  }
+  return CallNextHookEx(NULL, code, wparam, lparam);
 }
 
-// This function is called repeatedly by the OS while the key is held down (e.g., during a drag operation).
-LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION) {
-        KBDLLHOOKSTRUCT *p = (KBDLLHOOKSTRUCT *)lParam;
-        // If the flag isLeftDown is not set, 
-        // the folder opens when holding the click with Caps Lock pressed, unlike using the mouse where it doesn't open.
-        if (p->vkCode == VK_CAPITAL) {
-            if (wParam == WM_KEYDOWN && ! isLeftDown) {
-                sendMouseLeftDown();
-                isLeftDown = 1;
-                return 1;
-            } else if (wParam == WM_KEYUP && isLeftDown) {
-                sendMouseLeftUp();
-                isLeftDown = 0;
-                return 1;
-            }
-
-            // During dragging, the keydown event is triggered repeatedly once the flag isLeftDown is set to 1.
-            // To prevent this, we return early here.
-            return 1;
-        }
-    }
-    return CallNextHookEx(NULL, nCode, wParam, lParam);
-}
-
-int main() {
-    FreeConsole();
-    
-    HANDLE hMutex;
-
-    int response = find_mutex(MUTEX_KEY_RUNNER);
-    if (response == MUTEX_FOUND) {
-        return 0;
-    } else {
-        hMutex = create_global_mutex(MUTEX_KEY_RUNNER);
-
-        if (! hMutex) {
-            return 1;
-        }
-    }
-
-    HHOOK hHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardProc, NULL, 0);
-    if (! hHook) {
-        return 1;
-    }
-
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    UnhookWindowsHookEx(hHook);
-    close_mutex(hMutex);
-
+int main(void) {
+  // Single-instance guard. The mutex is held for the runner's whole lifetime
+  // and doubles as the "running" flag that cm.exe checks.
+  HANDLE mutex = CreateMutexA(NULL, FALSE, RUNNER_MUTEX_NAME);
+  if (!mutex) {
+    return 1;
+  }
+  if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    CloseHandle(mutex);
     return 0;
+  }
+
+  // `cm off` signals this event instead of killing the process, so the hook
+  // below is removed and all handles are released cleanly.
+  HANDLE stop = CreateEventA(NULL, TRUE, FALSE, RUNNER_STOP_EVENT_NAME);
+  if (!stop) {
+    CloseHandle(mutex);
+    return 1;
+  }
+
+  HHOOK hook = SetWindowsHookExA(WH_KEYBOARD_LL, keyboard_proc, NULL, 0);
+  if (!hook) {
+    CloseHandle(stop);
+    CloseHandle(mutex);
+    return 1;
+  }
+
+  // A low-level keyboard hook only fires while this thread pumps messages,
+  // so wait on the stop event and the message queue at the same time.
+  int running = 1;
+  while (running) {
+    DWORD wait = MsgWaitForMultipleObjects(1, &stop, FALSE, INFINITE, QS_ALLINPUT);
+    if (wait == WAIT_OBJECT_0) {
+      break; // stop requested by `cm off`
+    }
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+      if (msg.message == WM_QUIT) {
+        running = 0;
+        break;
+      }
+      TranslateMessage(&msg);
+      DispatchMessageA(&msg);
+    }
+  }
+
+  UnhookWindowsHookEx(hook);
+  CloseHandle(stop);
+  CloseHandle(mutex);
+  return 0;
 }

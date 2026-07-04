@@ -1,427 +1,417 @@
+// Command handlers for the Windows CLI. The dispatch loop lives in
+// packages/common/main.c; this file supplies the command table and the
+// platform-specific work.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
 
-#include "constants/app_constants.h"
-#include "constants/key_constants.h"
-#include "constants/result_constants.h"
-#include "utils/common.h"
-#include "utils/mutex.h"
-#include "utils/env.h"
-#include "utils/registry.h"
+#include "app.h"
+#include "cli.h"
 
-#include "process.h"
+// Older MinGW headers don't define this console-mode flag.
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
 
-int on_runner() {
-    int response = find_mutex(MUTEX_KEY_RUNNER);
-    if (response == MUTEX_FOUND) {
-        printf(MUTEX_FOUND_MESSAGE);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// Directory of cm.exe, including the trailing backslash. Returns 1 on success.
+static int get_exe_dir(char* dir, DWORD size) {
+  DWORD len = GetModuleFileNameA(NULL, dir, size);
+  if (len == 0 || len >= size) {
+    fprintf(stderr, "Failed to get the executable path.\n");
+    return 0;
+  }
+  char* lastSep = strrchr(dir, '\\');
+  if (!lastSep) {
+    fprintf(stderr, "Unexpected executable path: %s\n", dir);
+    return 0;
+  }
+  lastSep[1] = '\0';
+  return 1;
+}
+
+// The runner holds this mutex for its whole lifetime, so its mere existence
+// answers "is the mapper running?".
+static int runner_is_running(void) {
+  HANDLE mutex = OpenMutexA(SYNCHRONIZE, FALSE, RUNNER_MUTEX_NAME);
+  if (!mutex) {
+    return 0;
+  }
+  CloseHandle(mutex);
+  return 1;
+}
+
+// Reads HKCU\Environment's Path value into a malloc'd buffer with `extra`
+// spare bytes for appending. RRF_NOEXPAND keeps REG_EXPAND_SZ values raw so
+// we can write them back without destroying %VAR% references; the original
+// value type is reported through `type` for that purpose.
+// On success the caller owns the buffer and must RegCloseKey(*key).
+static char* read_user_path(HKEY* key, DWORD extra, DWORD* type) {
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, "Environment", 0, KEY_READ | KEY_WRITE, key) !=
+      ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to open HKCU\\Environment.\n");
+    return NULL;
+  }
+
+  DWORD flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+  DWORD size = 0;
+  if (RegGetValueA(*key, NULL, "Path", flags, type, NULL, &size) != ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to query the Path environment variable.\n");
+    RegCloseKey(*key);
+    return NULL;
+  }
+
+  char* env = malloc(size + extra);
+  if (!env) {
+    fprintf(stderr, "Memory allocation failed.\n");
+    RegCloseKey(*key);
+    return NULL;
+  }
+
+  if (RegGetValueA(*key, NULL, "Path", flags, NULL, env, &size) != ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to read the Path environment variable.\n");
+    free(env);
+    RegCloseKey(*key);
+    return NULL;
+  }
+
+  return env;
+}
+
+// Writes the Path value back with its original type and tells running apps
+// (e.g. new terminals) that the environment changed.
+static int write_user_path(HKEY key, const char* env, DWORD type) {
+  if (RegSetValueExA(key, "Path", 0, type, (const BYTE*)env, (DWORD)strlen(env) + 1) !=
+      ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to set the Path environment variable.\n");
+    return 0;
+  }
+  SendMessageTimeoutA(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)"Environment",
+                      SMTO_ABORTIFHUNG, 5000, NULL);
+  return 1;
+}
+
+// Finds `dir` inside a Path value, matching whole entries only: the hit must
+// be preceded by start-of-string or ';' and followed by ';' or end-of-string.
+// A plain strstr would also match inside longer sibling paths.
+static char* find_path_entry(char* env, const char* dir) {
+  size_t dirLen = strlen(dir);
+  for (char* p = strstr(env, dir); p; p = strstr(p + 1, dir)) {
+    int entryStart = (p == env) || (p[-1] == ';');
+    char after = p[dirLen];
+    if (entryStart && (after == ';' || after == '\0')) {
+      return p;
+    }
+  }
+  return NULL;
+}
+
+// Returns 1 if the Run key currently holds an APP_NAME value.
+static int startup_is_registered(void) {
+  HKEY key;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, KEY_QUERY_VALUE, &key) !=
+      ERROR_SUCCESS) {
+    return 0;
+  }
+  LONG result = RegQueryValueExA(key, APP_NAME, NULL, NULL, NULL, NULL);
+  RegCloseKey(key);
+  return result == ERROR_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// on / off / status
+// ---------------------------------------------------------------------------
+
+static int on_runner(void) {
+  if (runner_is_running()) {
+    printf("Program is already running.\n");
+    return EXIT_SUCCESS;
+  }
+
+  char path[MAX_PATH];
+  if (!get_exe_dir(path, sizeof(path))) {
+    return EXIT_FAILURE;
+  }
+  if (strlen(path) + strlen(RUNNER_EXE) + 1 > sizeof(path)) {
+    fprintf(stderr, "Executable path is too long.\n");
+    return EXIT_FAILURE;
+  }
+  strcat(path, RUNNER_EXE);
+
+  // CreateProcess instead of system("start ..."): no cmd.exe quoting issues,
+  // and the runner (a GUI-subsystem binary) detaches on its own.
+  STARTUPINFOA si = {0};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi = {0};
+  if (!CreateProcessA(path, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+    fprintf(stderr, "Failed to start %s (error %lu).\n", RUNNER_EXE, GetLastError());
+    return EXIT_FAILURE;
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+
+  printf("Program has started.\n");
+  return EXIT_SUCCESS;
+}
+
+static int off_runner(void) {
+  if (!runner_is_running()) {
+    printf("Program was not running.\n");
+    return EXIT_SUCCESS;
+  }
+
+  // Signal the stop event instead of taskkill /F, so the runner gets to
+  // remove its keyboard hook and release its handles.
+  HANDLE stop = OpenEventA(EVENT_MODIFY_STATE, FALSE, RUNNER_STOP_EVENT_NAME);
+  if (!stop) {
+    fprintf(stderr, "Failed to reach the runner (error %lu).\n", GetLastError());
+    return EXIT_FAILURE;
+  }
+  SetEvent(stop);
+  CloseHandle(stop);
+
+  // The runner exits within a few milliseconds; poll briefly to confirm.
+  for (int i = 0; i < 20; i++) {
+    if (!runner_is_running()) {
+      printf("Program has stopped.\n");
+      return EXIT_SUCCESS;
+    }
+    Sleep(100);
+  }
+
+  fprintf(stderr, "Runner did not stop in time.\n");
+  return EXIT_FAILURE;
+}
+
+static int show_status(void) {
+  // Enable ANSI colors on this console.
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  DWORD mode = 0;
+  if (out != INVALID_HANDLE_VALUE && GetConsoleMode(out, &mode)) {
+    SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+  }
+
+  int running = runner_is_running();
+  int registered = startup_is_registered();
+
+  // PATH check: is the directory containing cm.exe a whole entry of the
+  // user's Path value?
+  int envFound = 0;
+  char dir[MAX_PATH];
+  if (get_exe_dir(dir, sizeof(dir))) {
+    HKEY key;
+    DWORD type;
+    char* env = read_user_path(&key, 1, &type);
+    if (env) {
+      envFound = find_path_entry(env, dir) != NULL;
+      free(env);
+      RegCloseKey(key);
+    }
+  }
+
+  printf("[Running status]    %s\n",
+         running ? "\033[0;32mRunning.\033[0m" : "\033[0;31mNot running.\033[0m");
+  printf("[Env status]        %s\n",
+         envFound ? "\033[0;32mFound.\033[0m" : "\033[0;31mNot found.\033[0m");
+  printf("[Startup status]    %s\n",
+         registered ? "\033[0;32mRegistered.\033[0m" : "\033[0;31mNot registered.\033[0m");
+  return EXIT_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// env --add / --remove
+// ---------------------------------------------------------------------------
+
+static int add_env(void) {
+  char dir[MAX_PATH];
+  if (!get_exe_dir(dir, sizeof(dir))) {
+    return EXIT_FAILURE;
+  }
+
+  HKEY key;
+  DWORD type;
+  // Reserve room for ";" + dir.
+  char* env = read_user_path(&key, (DWORD)strlen(dir) + 2, &type);
+  if (!env) {
+    return EXIT_FAILURE;
+  }
+
+  int result = EXIT_SUCCESS;
+  if (find_path_entry(env, dir)) {
+    printf("The environment path already includes this executable.\n");
+  } else {
+    size_t len = strlen(env);
+    if (len > 0 && env[len - 1] != ';') {
+      strcat(env, ";");
+    }
+    strcat(env, dir);
+
+    if (write_user_path(key, env, type)) {
+      printf("Environment path has been updated successfully.\n");
     } else {
-        char path[MAX_PATH];
-        int currentPathResult = get_current_path(path, APP_CMD);
-        
-        if (currentPathResult != SUCCESS) {
-            if  (currentPathResult == ERR_GET_EXE_PATH) printf(ERR_GET_EXE_PATH_MESSAGE);
-            else if (currentPathResult == ERR_CUTPOINT_NOT_FOUND) printf(ERR_CUTPOINT_NOT_FOUND_MESSAGE);
-
-            return currentPathResult;
-        } 
-
-        strcat(path, APP_RUNNER);
-
-        char command[MAX_PATH + 20];
-        // snprintf(command, sizeof(command), "start /B %s", path);
-        snprintf(command, sizeof(command), "start \"\" /B \"%s\"", path);
-        system(command);
-
-        printf("Program has started.\n");
+      result = EXIT_FAILURE;
     }
+  }
 
-    return SUCCESS;
+  free(env);
+  RegCloseKey(key);
+  return result;
 }
 
-int off_runner() {
-    int response = find_mutex(MUTEX_KEY_RUNNER);
-    if (response == MUTEX_FOUND) {
-        char command[MAX_PATH + 20];
-        snprintf(command, sizeof(command), "taskkill /F /IM %s >nul 2>&1", APP_RUNNER);
-        system(command);
-        printf("Program has stopped.\n");
+static int remove_env(void) {
+  char dir[MAX_PATH];
+  if (!get_exe_dir(dir, sizeof(dir))) {
+    return EXIT_FAILURE;
+  }
+
+  HKEY key;
+  DWORD type;
+  char* env = read_user_path(&key, 1, &type);
+  if (!env) {
+    return EXIT_FAILURE;
+  }
+
+  int result = EXIT_SUCCESS;
+  char* entry = find_path_entry(env, dir);
+  if (!entry) {
+    printf("The specified path is not found in the environment variable.\n");
+  } else {
+    // Cut the entry plus one adjacent separator: the trailing ';' if the
+    // entry is not last, otherwise the leading one (if any).
+    size_t cutLen = strlen(dir);
+    if (entry[cutLen] == ';') {
+      cutLen++;
+    } else if (entry > env && entry[-1] == ';') {
+      entry--;
+      cutLen++;
+    }
+    memmove(entry, entry + cutLen, strlen(entry + cutLen) + 1);
+
+    if (write_user_path(key, env, type)) {
+      printf("Environment path has been removed successfully.\n");
     } else {
-        printf("Program was not running.\n");
+      result = EXIT_FAILURE;
     }
-    
-    return SUCCESS;
+  }
+
+  free(env);
+  RegCloseKey(key);
+  return result;
 }
 
-int show_status() {
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut == INVALID_HANDLE_VALUE) return FAIL;
+// ---------------------------------------------------------------------------
+// startup --add / --remove
+// ---------------------------------------------------------------------------
 
-    DWORD dwMode = 0;
-    if (GetConsoleMode(hOut, &dwMode)) {
-        dwMode |= 0x0004;
-        SetConsoleMode(hOut, dwMode);
-    }
+static int add_startup(void) {
+  if (startup_is_registered()) {
+    printf("Already registered.\n");
+    return EXIT_SUCCESS;
+  }
 
-    // 1. Check Mutex.
-    int mutex_response = find_mutex(MUTEX_KEY_RUNNER);
+  char dir[MAX_PATH];
+  if (!get_exe_dir(dir, sizeof(dir))) {
+    return EXIT_FAILURE;
+  }
 
-    // 2. Check Env.
-    // Get env path.
-    HKEY hKey_env = NULL;
-    DWORD size = 0;
-    char* envPath = NULL;
+  // The Run key value is parsed as a command line, so quote the path in case
+  // the install directory contains spaces.
+  char command[MAX_PATH + 2 + sizeof(RUNNER_EXE)];
+  snprintf(command, sizeof(command), "\"%s%s\"", dir, RUNNER_EXE);
 
-    int envPathResult = get_env_path(&hKey_env, &size, &envPath);
-    if (envPathResult != SUCCESS) {
-        if (envPathResult == ERR_REG_KEY_OPEN) printf(ERR_REG_KEY_OPEN_MESSAGE);
-        else if (envPathResult == ERR_ENV_QUERY_SIZE) printf(ERR_ENV_QUERY_SIZE_MESSAGE);
-        else if (envPathResult == ERR_MEMORY_ALLOCATION) printf(ERR_MEMORY_ALLOCATION_MESSAGE);
-        else if (envPathResult == ERR_GET_ENVIRONMENT_VAR) printf(ERR_GET_ENVIRONMENT_VAR_MESSAGE);
+  HKEY key;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, KEY_SET_VALUE, &key) !=
+      ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to open the startup registry key.\n");
+    return EXIT_FAILURE;
+  }
+  LONG result =
+      RegSetValueExA(key, APP_NAME, 0, REG_SZ, (const BYTE*)command, (DWORD)strlen(command) + 1);
+  RegCloseKey(key);
 
-        RegCloseKey(hKey_env);
-        free(envPath);
-
-        return envPathResult;
-    }
-
-    // Get exe dir path.
-    char exeDirPath[MAX_PATH];
-    int currentPathResult = get_current_path(exeDirPath, APP_CMD);
-    strcat(exeDirPath, ";");
-    
-    if (currentPathResult != SUCCESS) {
-        if  (currentPathResult == ERR_GET_EXE_PATH) printf(ERR_GET_EXE_PATH_MESSAGE);
-        else if (currentPathResult == ERR_CUTPOINT_NOT_FOUND) printf(ERR_CUTPOINT_NOT_FOUND_MESSAGE);
-
-        free(envPath);
-        RegCloseKey(hKey_env);
-
-        return currentPathResult;
-    } 
-    // Remember call free(envPath) & RegCloseKey(hKey_env)
-
-    // 3. Check Registry.
-    int registry_response = find_registry();
-    if (registry_response == ERR_REG_KEY_OPEN) {
-        free(envPath);
-        RegCloseKey(hKey_env);
-
-        printf(ERR_REG_KEY_OPEN_MESSAGE);
-        return ERR_REG_KEY_OPEN;
-    }
-
-    // 4. print.
-    printf("[Running status]    %s\n", mutex_response == MUTEX_FOUND ? "\033[0;32mRunning.\033[0m" : "\033[0;31mNot running.\033[0m");
-    printf("[Env status]        %s\n", strstr(envPath, exeDirPath) != NULL ? "\033[0;32mfound.\033[0m" : "\033[0;31mNot Found.\033[0m");
-    printf("[Registry status]   %s\n", registry_response == REGISTRY_FOUND ? "\033[0;32mFound.\033[0m" : "\033[0;31mNot found.\033[0m");
-    
-    // 5. clean.
-    free(envPath);
-    RegCloseKey(hKey_env);
-    return SUCCESS;
+  if (result != ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to register the startup entry.\n");
+    return EXIT_FAILURE;
+  }
+  printf("Startup entry registered successfully.\n");
+  return EXIT_SUCCESS;
 }
 
-int add_env() {
-    HKEY hKey;
-    DWORD size = 0;
-    char* envPath = NULL;
+static int remove_startup(void) {
+  if (!startup_is_registered()) {
+    printf("Already removed.\n");
+    return EXIT_SUCCESS;
+  }
 
-    int envPathResult = get_env_path(&hKey, &size, &envPath);
-    if (envPathResult != SUCCESS) {
-        if (envPathResult == ERR_REG_KEY_OPEN) printf(ERR_REG_KEY_OPEN_MESSAGE);
-        else if (envPathResult == ERR_ENV_QUERY_SIZE) printf(ERR_ENV_QUERY_SIZE_MESSAGE);
-        else if (envPathResult == ERR_MEMORY_ALLOCATION) printf(ERR_MEMORY_ALLOCATION_MESSAGE);
-        else if (envPathResult == ERR_GET_ENVIRONMENT_VAR) printf(ERR_GET_ENVIRONMENT_VAR_MESSAGE);
+  HKEY key;
+  if (RegOpenKeyExA(HKEY_CURRENT_USER, STARTUP_REG_PATH, 0, KEY_SET_VALUE, &key) !=
+      ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to open the startup registry key.\n");
+    return EXIT_FAILURE;
+  }
+  LONG result = RegDeleteValueA(key, APP_NAME);
+  RegCloseKey(key);
 
-        free(envPath);
-        RegCloseKey(hKey);
-
-        return envPathResult;
-    }
-
-    char exeDirPath[MAX_PATH];
-    int currentPathResult = get_current_path(exeDirPath, APP_CMD);
-
-    if (currentPathResult != SUCCESS) {
-        if  (currentPathResult == ERR_GET_EXE_PATH) printf(ERR_GET_EXE_PATH_MESSAGE);
-        else if (currentPathResult == ERR_CUTPOINT_NOT_FOUND) printf(ERR_CUTPOINT_NOT_FOUND_MESSAGE);
-
-        free(envPath);
-        RegCloseKey(hKey);
-
-        return currentPathResult;
-    } 
-    
-    strcat(exeDirPath, ";");
-    if (strstr(envPath, exeDirPath) == NULL) {
-        size_t envLen = strlen(envPath);
-        if (envLen > 0 && envPath[envLen - 1] != ';') {
-            strcat(envPath, ";");
-        }
-        strcat(envPath, exeDirPath);
-
-        if (RegSetValueEx(hKey, "Path", 0, REG_SZ, (BYTE*)envPath, strlen(envPath) + 1) != ERROR_SUCCESS) {
-            free(envPath);
-            RegCloseKey(hKey);
-            printf(ERR_SET_ENVIRONMENT_VAR_MESSAGE);
-            return ERR_SET_ENVIRONMENT_VAR;
-        }
-
-        SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
-        printf("Environment path has been updated successfully.\n");
-    } else {
-        printf("The environment path already includes this executable.\n");
-    }
-    
-    free(envPath);
-    RegCloseKey(hKey);
-    return SUCCESS;
+  if (result != ERROR_SUCCESS) {
+    fprintf(stderr, "Failed to remove the startup entry.\n");
+    return EXIT_FAILURE;
+  }
+  printf("Startup entry removed successfully.\n");
+  return EXIT_SUCCESS;
 }
 
-int remove_env() {
-    HKEY hKey;
-    DWORD size = 0;
-    char* envPath = NULL;
+// ---------------------------------------------------------------------------
+// help / version
+// ---------------------------------------------------------------------------
 
-    int envPathResult = get_env_path(&hKey, &size, &envPath);
-    if (envPathResult != SUCCESS) {
-        if (envPathResult == ERR_REG_KEY_OPEN) printf(ERR_REG_KEY_OPEN_MESSAGE);
-        else if (envPathResult == ERR_ENV_QUERY_SIZE) printf(ERR_ENV_QUERY_SIZE_MESSAGE);
-        else if (envPathResult == ERR_MEMORY_ALLOCATION) printf(ERR_MEMORY_ALLOCATION_MESSAGE);
-        else if (envPathResult == ERR_GET_ENVIRONMENT_VAR) printf(ERR_GET_ENVIRONMENT_VAR_MESSAGE);
-
-        free(envPath);
-        RegCloseKey(hKey);
-        return envPathResult;
-    }
-
-    char exeDirPath[MAX_PATH];
-    int currentPathResult = get_current_path(exeDirPath, APP_CMD);
-
-    if (currentPathResult != SUCCESS) {
-        if  (currentPathResult == ERR_GET_EXE_PATH) printf(ERR_GET_EXE_PATH_MESSAGE);
-        else if (currentPathResult == ERR_CUTPOINT_NOT_FOUND) printf(ERR_CUTPOINT_NOT_FOUND_MESSAGE);
-
-        free(envPath);
-        RegCloseKey(hKey);
-        return currentPathResult;
-    } 
-
-    char* pathStart = strstr(envPath, exeDirPath);
-
-    if (pathStart != NULL) {
-        size_t pathLen = strlen(exeDirPath);
-        memmove(pathStart, pathStart + pathLen, strlen(pathStart + pathLen) + 1);
-
-        size_t envLen = strlen(envPath);
-        if (envLen > 0 && envPath[envLen - 1] == ';') {
-            envPath[envLen - 1] = '\0';  
-        }
-
-        if (RegSetValueEx(hKey, "Path", 0, REG_SZ, (BYTE*)envPath, strlen(envPath) + 1) != ERROR_SUCCESS) {
-            free(envPath);
-            RegCloseKey(hKey);
-            printf(ERR_SET_ENVIRONMENT_VAR_MESSAGE);
-            return ERR_SET_ENVIRONMENT_VAR;
-        }
-
-        SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)"Environment", SMTO_ABORTIFHUNG, 5000, NULL);
-        printf("Environment path has been removed successfully.\n");
-    } else {
-        printf("The specified path is not found in the environment variable.\n");
-    }
-
-    free(envPath);
-    RegCloseKey(hKey);
-    return SUCCESS;
+static int show_version(void) {
+  printf("%s\n", APP_VERSION);
+  return EXIT_SUCCESS;
 }
 
-int add_registry() {
-    int response = find_registry();
-    if (response == ERR_REG_KEY_OPEN) {
-        printf(ERR_REG_KEY_OPEN_MESSAGE);
-        return ERR_REG_KEY_OPEN;
-    } else if (response == REGISTRY_FOUND) {
-        printf("Already registered.\n");
-        return SUCCESS;
-    } 
-    
-    // response == REGISTRY_NOT_FOUND ↓
-    
-    char exeDirPath[MAX_PATH];
-    int currentPathResult = get_current_path(exeDirPath, APP_CMD);
+static int show_help(void) {
+  printf("Usage:\n");
+  printf("  cm on                    - Start mapper process\n");
+  printf("  cm off                   - Terminate mapper process\n\n");
 
-    if (currentPathResult != SUCCESS) {
-        if  (currentPathResult == ERR_GET_EXE_PATH) printf(ERR_GET_EXE_PATH_MESSAGE);
-        else if (currentPathResult == ERR_CUTPOINT_NOT_FOUND) printf(ERR_CUTPOINT_NOT_FOUND_MESSAGE);
+  printf("  cm status | s            - Check mapper status\n\n");
 
-        return currentPathResult;
-    } 
+  printf("  cm env | e               - Manage the user PATH variable\n");
+  printf("      --add     | -a       - Add this directory to PATH\n");
+  printf("      --remove  | -r       - Remove this directory from PATH\n\n");
 
-    strcat(exeDirPath, APP_RUNNER);
+  printf("  cm startup | st          - Manage auto-start at boot\n");
+  printf("      --add     | -a       - Register the mapper to start at boot\n");
+  printf("      --remove  | -r       - Remove the mapper from startup\n\n");
 
-    HKEY hKey;
-    LONG openResult = RegOpenKeyEx(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &hKey);
-
-    if (openResult != ERROR_SUCCESS) {
-        printf(ERR_REG_KEY_OPEN_MESSAGE);
-        return ERR_REG_KEY_OPEN;
-    }
-
-    LONG setResult = RegSetValueEx(hKey, APP_NAME, 0, REG_SZ, (BYTE*)exeDirPath, strlen(exeDirPath) + 1);
-    RegCloseKey(hKey);
-    
-    if (setResult == ERROR_SUCCESS) {
-        printf("Registry successfully registered.\n");
-        return SUCCESS;
-    } else {
-        printf(ERR_SET_REGISTRY_MESSAGE);
-        return ERR_SET_REGISTRY;
-    }
+  printf("  cm --help    | -h        - Show this help message\n");
+  printf("  cm --version | -v        - Show version info\n");
+  return EXIT_SUCCESS;
 }
 
-int remove_registry() {
-    int response = find_registry();
-    if (response == ERR_REG_KEY_OPEN) {
-        printf(ERR_REG_KEY_OPEN_MESSAGE);
-        return ERR_REG_KEY_OPEN;
-    } else if (response == REGISTRY_NOT_FOUND) {
-        printf("Already removed.\n");
-        return SUCCESS;
-    }
-
-    // response == REGISTRY_FOUND ↓
-
-    HKEY hKey;
-    LONG regResult = RegOpenKeyEx(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &hKey);
-
-    if (regResult != ERROR_SUCCESS) {
-        printf(ERR_REG_KEY_OPEN_MESSAGE);
-        return ERR_REG_KEY_OPEN;
-    }
-
-    regResult = RegDeleteValue(hKey, APP_NAME);
-    RegCloseKey(hKey);
-
-    if (regResult == ERROR_SUCCESS) {
-        printf("Registry entry removed successfully.\n");
-        return SUCCESS;
-    } else {
-        printf(ERR_DELETE_REGISTRY_MESSAGE);
-        return ERR_DELETE_REGISTRY;
-    }
+int show_help_invalid(void) {
+  printf("Invalid command. Use '--help' to see available options.\n");
+  return EXIT_FAILURE;
 }
 
-int show_version() {
-    printf("%s\n", VERSION);
-    return SUCCESS;
-}
+// ---------------------------------------------------------------------------
+// Command table (consumed by packages/common/main.c)
+// ---------------------------------------------------------------------------
 
-int show_help() {
-    printf("Usage:\n");
-    printf("  on                       - Start mapper process\n");
-    printf("  off                      - Terminate mapper process\n\n");
-    
-    printf("  status | s               - Check mapper status\n\n");
-
-    printf("  env | e                  - Manage environment variables\n");
-    printf("      --add     | -a       - Add environment variables\n");
-    printf("      --remove  | -r       - Remove environment variables\n\n");
-
-    printf("  reg | r                  - Manage registry startup entry\n");
-    printf("      --add     | -a       - Add mapper to startup (via registry)\n");
-    printf("      --remove  | -r       - Remove mapper from startup\n\n");
-
-    printf("  --help    | -h           - Show this help message\n");
-    printf("  --version | -v           - Show version info\n");
-
-    return SUCCESS;
-}
-
-int show_help_invalid() {
-    printf("Invalid command. Use '--help' to see available options.\n");
-    return SUCCESS;
-}
-
-// Check for NULL 'name' values to terminate the list of commands and options.
-struct CommandWithOptions commandWithOptions[] = {
-    {
-        .command = {
-            "on",
-            "on",
-            on_runner
-        },
-        .options = {
-            { NULL, NULL, NULL }
-        }
-    },
-    {
-        .command = {
-            "off",
-            "off",
-            off_runner
-        },
-        .options = {
-            { NULL, NULL, NULL }
-        }
-    },
-        {
-        .command = {
-            "status",
-            "s",
-            show_status
-        },
-        .options = {
-            { NULL, NULL, NULL }
-        }
-    },
-    {
-        .command = {
-            NULL,
-            NULL,
-            NULL
-        },
-        .options = {
-            { "--help", "-h", show_help },
-            { "--version", "-v", show_version },
-            { NULL, NULL, NULL }
-        }
-    },
-    {
-        .command = {
-            "env",
-            "e",
-            NULL
-        },
-        .options = {
-            { "--add", "-a", add_env },
-            { "--remove", "-r", remove_env },
-            { NULL, NULL, NULL }
-        }
-    },
-    {
-        .command = {
-            "reg",
-            "r",
-            NULL
-        },
-        .options = {
-            { "--add", "-a", add_registry },
-            { "--remove", "-r", remove_registry },
-            { NULL, NULL, NULL }
-        }
-    },
-    {
-        .command = {
-            NULL,
-            NULL,
-            NULL
-        },
-        .options = {
-            { NULL, NULL, NULL }
-        }
-    },
+const CliCommand cli_commands[] = {
+    {"on", "on", NULL, NULL, on_runner},
+    {"off", "off", NULL, NULL, off_runner},
+    {"status", "s", NULL, NULL, show_status},
+    {"env", "e", "--add", "-a", add_env},
+    {"env", "e", "--remove", "-r", remove_env},
+    {"startup", "st", "--add", "-a", add_startup},
+    {"startup", "st", "--remove", "-r", remove_startup},
+    {"--help", "-h", NULL, NULL, show_help},
+    {"--version", "-v", NULL, NULL, show_version},
+    {NULL, NULL, NULL, NULL, NULL},
 };
