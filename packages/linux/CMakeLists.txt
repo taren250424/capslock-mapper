@@ -1,25 +1,19 @@
-cmake_minimum_required(VERSION 3.10)
-project(CapsLockMouseLinux C)
+# cm        - CLI that controls the runner
+# cm_runner - resident key-mapping daemon (evdev/uinput; requires root)
+#
+# Built via the top-level CMakeLists.txt, which provides CM_COMMON_DIR.
 
-set(CMAKE_C_STANDARD 11)
-add_definitions(-D_GNU_SOURCE)
-if(CMAKE_COMPILER_IS_GNUCC OR CMAKE_C_COMPILER_ID MATCHES "Clang")
-    add_compile_options(-Wno-unused-result)
-    # add_compile_options(-Wall -Wextra -O2)
-endif()
-
-include_directories(
-    src
-    src/constants
-    src/utils
+add_executable(cm
+  ${CM_COMMON_DIR}/main.c
+  src/process.c
 )
 
-set(COMMON_SOURCES
-    src/constants/app_constants.c   
-    src/constants/result_constants.c
-    src/process.c
+add_executable(cm_runner
+  src/runner.c
 )
 
-add_executable(cm src/main.c ${COMMON_SOURCES})
-add_executable(cm_runner src/runner.c ${COMMON_SOURCES})
-
+foreach(target cm cm_runner)
+  target_include_directories(${target} PRIVATE src ${CM_COMMON_DIR})
+  target_compile_options(${target} PRIVATE -Wall -Wextra -O2)
+  target_compile_definitions(${target} PRIVATE _GNU_SOURCE)
+endforeach()
