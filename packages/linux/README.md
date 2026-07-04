@@ -1,3 +1,10 @@
+<!--
+NOTE (v2.0.0): this README still documents the released v1 binaries on
+purpose. Update it together with the v2 Linux release; the only user-facing
+change is the command rename `service | srv` -> `startup | st`, plus the
+CMake build (see packages/linux/TODO.md).
+-->
+
 # CapsLock Mapper (Linux Version)
 
 A small Linux utility that maps the Caps Lock key to simulate a left mouse click, helping reduce strain on your right wrist. It offers fast and simple command-line options, making it especially useful for developers who are comfortable with the CLI.

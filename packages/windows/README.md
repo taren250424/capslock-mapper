@@ -26,20 +26,22 @@ The utility supports the following commands:
 Usage:
   cm on                       - Start mapper process
   cm off                      - Terminate mapper process
-  
+
   cm status | cm s            - Check mapper status
 
-  cm env | cm e               - Manage environment variables
-      --add     | -a          - Add environment variables
-      --remove  | -r          - Remove environment variables
+  cm env | cm e               - Manage the user PATH variable
+      --add     | -a          - Add this directory to PATH
+      --remove  | -r          - Remove this directory from PATH
 
-  cm reg | cm r               - Manage registry startup entry
-      --add     | -a          - Add mapper to startup (via registry)
-      --remove  | -r          - Remove mapper from startup
+  cm startup | cm st          - Manage auto-start at boot
+      --add     | -a          - Register the mapper to start at boot
+      --remove  | -r          - Remove the mapper from startup
 
   cm --help    | -h           - Show help message
   cm --version | -v           - Show version info
 ```
+
+> Upgrading from v1: the `reg | r` command was renamed to `startup | st` in v2.0.0.
 
 
 ## Example Usage
@@ -51,11 +53,11 @@ cm off                        # Terminate mapper process
 cm status                     # Check mapper status
 cm s                          # Alias for status
 
-cm env --add                  # Add environment variables
-cm e -r                       # Remove environment variables (alias for env)
+cm env --add                  # Add this directory to the user PATH
+cm e -r                       # Remove it (alias for env)
 
-cm reg --add                  # Register mapper to run at startup
-cm r -r                       # Remove mapper from registry (alias for reg)
+cm startup --add              # Register mapper to run at startup
+cm st -r                      # Remove mapper from startup (alias for startup)
 
 cm --help                     # Show help message
 cm -v                         # Show version info
@@ -76,7 +78,7 @@ After extracting the files, follow these steps to set up the application:
    Navigate to the extracted directory and run the following command to add the necessary environment variable:
 
 ```bash
-.\cm env -add
+.\cm env --add
 ```
 
 After this, you will be able to use the cm command in your terminal. If the command doesn't work immediately, try restarting your terminal.
@@ -90,11 +92,23 @@ cm env --remove
    To make sure the key mapping is applied automatically after every system boot, run:
 
 ```bash
-cm reg --add
+cm startup --add
 ```
 
 This will add the necessary registry entry. If you want to disable this feature later, run:
 
 ```bash
-cm reg --remove
+cm startup --remove
 ```
+
+
+## Building from Source
+
+Requires CMake (3.13+) and a C compiler (e.g. MinGW-w64). From the repository root:
+
+```bash
+cmake -S . -B build -G "MinGW Makefiles"
+cmake --build build
+```
+
+The binaries are produced in `build/packages/windows/` (`cm.exe`, `cm_runner.exe`).
