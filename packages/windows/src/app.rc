@@ -1,0 +1,6 @@
+#include <windows.h>
+
+/* Embed the application manifest. ID 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID)
+   is what Windows reads for an .exe. windres resolves the filename relative
+   to this .rc file's directory. */
+1 RT_MANIFEST "app.manifest"
